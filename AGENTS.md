@@ -171,6 +171,8 @@ atomic `mv`. When woken, handle the batch under this contract:
   formulas (the delimiters are stripped and the content shows as-is).
 - The script already lit the "typing…" indicator on arrival; refresh it if
   composing takes >30s and stop it after sending.
+- Shared-context snapshot (cold start only): before composing, also read `~/hooks/state/shared-context.md` when it exists and is fresher than 6 hours — it carries recent main-chat decisions and open topics not yet in the long-term memory files. A missing, stale, or corrupt snapshot is silently skipped, and the batch proceeds as if there were none; if it contradicts the long-term memory files, the memory files win. Never re-read it while warm — your context is already current.
+- Write-back events (end of batch): if this batch produced new facts the main chat should know (a decision the owner stated, a new status for an active project, a new open topic), append at most 3 lines to `~/hooks/state/memory-events.jsonl`, one JSON object per line: {"ts": "ISO time +08:00", "source": "wechat", "type": "decision|project_update|fact|pending", "content": "one-sentence fact", "ref": "the batch's first message_id", "status": "new"}. Only facts with a source message; no inferences, nothing already in the long-term memory files, no passwords/keys/tokens/codes. Trim the oldest lines when the file passes 200 lines.
 - **Stay warm for follow-ups**: after cleanup, run
   `examples/muse-hook/ilink-warm-wait.sh` instead of ending the turn. It
   maintains the warm marker the watch script checks (while its heartbeat

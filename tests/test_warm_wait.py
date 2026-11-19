@@ -57,7 +57,12 @@ class WarmWaitTest(unittest.TestCase):
     def test_new_messages_exit_keeps_marker(self):
         proc = subprocess.Popen(["bash", HELPER], env=self.env,
                                 stdout=subprocess.PIPE, text=True)
-        time.sleep(1.2)
+        # Inject the batch well inside the 2s idle window: the old
+        # 1.2s sleep left only ~0.8s of slack, and on a loaded CI
+        # runner the sleep can overshoot past the deadline, so the
+        # waiter had already exited IDLE_TIMEOUT before the file
+        # landed (flaky failure on 3.10, 2026-11-15).
+        time.sleep(0.5)
         with open(os.path.join(self.state, "ilink-pending.json"), "w") as f:
             json.dump({"msgs": [{"message_id": 1}]}, f)
         out, _ = proc.communicate(timeout=10)
