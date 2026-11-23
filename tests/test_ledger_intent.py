@@ -80,7 +80,7 @@ class IntentTest(unittest.TestCase):
         def slow_api(*args, **kwargs):
             time.sleep(0.3)
             calls.append(args[2]["msg"]["client_id"])
-            return {"code": 0}
+            return {"code": 0, "message_id": "mid-1"}
 
         # NOTE: per-thread stdout capture is not used here on purpose:
         # redirect_stdout swaps a process-global stream, so two racing
@@ -115,7 +115,7 @@ class IntentTest(unittest.TestCase):
 
         def api(*args, **kwargs):
             api_cids.append(args[2]["msg"]["client_id"])
-            return {"code": 0}
+            return {"code": 0, "message_id": "mid-1"}
 
         orig_mark = ilink._mark_send_ledger_sent
         calls = {"n": 0}
@@ -150,7 +150,7 @@ class IntentTest(unittest.TestCase):
         with mock.patch.object(
                 ilink, "_send_ledger_lock",
                 side_effect=AssertionError("lock must not be taken")), \
-                mock.patch.object(ilink, "api", return_value={"code": 0}):
+                mock.patch.object(ilink, "api", return_value={"code": 0, "message_id": "mid-1"}):
             code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi")
         self.assertEqual(code, 0)
         self.assertIn("SEND_OK", out)
@@ -162,7 +162,7 @@ class IntentTest(unittest.TestCase):
             json.dump({"k-old": {"client_id": "c-old",
                                   "at": int(time.time()),
                                   "result": "ok"}}, f)
-        api = mock.Mock(return_value={"code": 0})
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
         with mock.patch.object(ilink, "api", api):
             code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="k-old")
         self.assertEqual(code, 0)
@@ -186,7 +186,7 @@ class LedgerWriteFailureTest(unittest.TestCase):
             return []
 
     def test_intent_write_failure_aborts_send_before_api(self):
-        api = mock.Mock(return_value={"code": 0})
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
         with mock.patch.object(ilink, "api", api), \
                 mock.patch.object(ilink, "_write_send_ledger",
                                   side_effect=OSError("disk full")):
@@ -210,7 +210,7 @@ class LedgerWriteFailureTest(unittest.TestCase):
 
         def api(*args, **kwargs):
             api_cids.append(args[2]["msg"]["client_id"])
-            return {"code": 0}
+            return {"code": 0, "message_id": "mid-1"}
 
         orig_write = ilink._write_send_ledger
         calls = {"n": 0}
@@ -324,7 +324,7 @@ class LedgerFailClosedTest(unittest.TestCase):
             return []
 
     def test_lock_failure_aborts_keyed_send(self):
-        api = mock.Mock(return_value={"code": 0})
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
         with mock.patch.object(ilink, "api", api), \
                 mock.patch.object(ilink.fcntl, "flock",
                                   side_effect=OSError("flock broke")):
@@ -340,7 +340,7 @@ class LedgerFailClosedTest(unittest.TestCase):
         self.assertEqual(errors[0]["error"], "OSError")
 
     def test_lock_failure_keyless_send_unaffected(self):
-        api = mock.Mock(return_value={"code": 0})
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
         with mock.patch.object(ilink, "api", api), \
                 mock.patch.object(ilink.fcntl, "flock",
                                   side_effect=OSError("flock broke")):
@@ -352,7 +352,7 @@ class LedgerFailClosedTest(unittest.TestCase):
     def test_fcntl_missing_keeps_noop(self):
         # Non-POSIX platforms have no fcntl module at all: the lock is
         # documented no-op there, and keyed sends must still work.
-        api = mock.Mock(return_value={"code": 0})
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
         with mock.patch.object(ilink, "api", api), \
                 mock.patch.object(ilink, "fcntl", None):
             code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi",
@@ -364,7 +364,7 @@ class LedgerFailClosedTest(unittest.TestCase):
     def test_corrupt_ledger_aborts_keyed_send(self):
         with open(ilink.SEND_LEDGER_FILE, "w") as f:
             f.write("garbage{")
-        api = mock.Mock(return_value={"code": 0})
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
         with mock.patch.object(ilink, "api", api):
             code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi",
                              key="k-corrupt")
@@ -380,7 +380,7 @@ class LedgerFailClosedTest(unittest.TestCase):
     def test_non_object_ledger_aborts_keyed_send(self):
         with open(ilink.SEND_LEDGER_FILE, "w") as f:
             json.dump([1, 2], f)
-        api = mock.Mock(return_value={"code": 0})
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
         with mock.patch.object(ilink, "api", api):
             code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi",
                              key="k-list-ledger")
@@ -390,7 +390,7 @@ class LedgerFailClosedTest(unittest.TestCase):
 
     def test_missing_ledger_file_sends_normally(self):
         # Missing is not corrupt: a fresh deploy has no ledger yet.
-        api = mock.Mock(return_value={"code": 0})
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
         with mock.patch.object(ilink, "api", api):
             code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi",
                              key="k-fresh")
@@ -401,7 +401,7 @@ class LedgerFailClosedTest(unittest.TestCase):
     def test_corrupt_ledger_media_intent_aborts_before_upload(self):
         with open(ilink.SEND_LEDGER_FILE, "w") as f:
             f.write("garbage{")
-        api = mock.Mock(return_value={"code": 0})
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
         upload = mock.Mock()
         with mock.patch.object(ilink, "api", api), \
                 mock.patch.object(ilink, "_upload_media", upload):
@@ -417,7 +417,7 @@ class LedgerFailClosedTest(unittest.TestCase):
         # marking: same unconfirmed exit as a mark write failure (the
         # message may already be delivered, but success is unconfirmed
         # and the retry reuses the intent's client_id).
-        api = mock.Mock(return_value={"code": 0})
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
         loads = [{}, ilink.LedgerCorrupt("boom")]
         with mock.patch.object(ilink, "api", api), \
                 mock.patch.object(ilink, "_load_send_ledger",

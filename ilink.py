@@ -43,6 +43,7 @@ Usage:
 """
 import base64
 import contextlib
+from datetime import datetime
 import functools
 import inspect
 import io
@@ -80,6 +81,9 @@ SEND_LEDGER_FILE = os.path.join(BRIDGE, "send_ledger.json")  # idempotency key -
 SEND_LEDGER_LOCK_FILE = os.path.join(BRIDGE, "send_ledger.lock")  # inter-process lock for keyed sends
 SEND_AUDIT_CAP = 1000  # audit lines kept; older lines are trimmed on write
 SEND_LEDGER_TTL = 86400  # ledger entries older than this are pruned on write
+DELIVERY_PENDING_FILE = os.path.join(BRIDGE, "delivery_pending.json")  # message_id -> {to, client_id, at, kind}: sent, echo not yet seen
+DELIVERY_ECHO_TIMEOUT = 120  # seconds without an echo before a sent message is reported no_echo
+DELIVERY_PENDING_CAP = 200  # entries kept; oldest pruned first on write
 QUOTE_CACHE_FILE = os.path.join(BRIDGE, "quote_cache.json")  # msg_id -> quoted original {text, kind, from, at, media_path?}; plus svr_id -> msg_id
 QUOTE_CACHE_LOCK_FILE = os.path.join(BRIDGE, "quote_cache.lock")  # inter-process lock for cache read-modify-write
 QUOTE_CACHE_TTL = 30 * 86400  # quoted originals older than this are pruned on write (mirrors official text retention)
@@ -339,6 +343,12 @@ def cmd_prune_media(max_age_days=MEDIA_PRUNE_MAX_AGE_DAYS,
 # outdated forever, since the check compares this constant with the
 # latest release tag.
 VERSION = "1.3.2"
+# iLink protocol channel version, following upstream
+# @tencent-weixin/openclaw-weixin 2.4.10 (2026-10-11). Upstream sends
+# its own package version here; this bridge used to hardcode "1.0.2"
+# and the server still accepted it, but the declared client is then
+# years behind. Bumped 2026-11-23 by user decision.
+CHANNEL_VERSION = "2.4.10"
 VERSION_CHECK_URL = ("https://api.github.com/repos/gfydfhcf/"
                      "wechat-ilink-muse-bridge/releases/latest")
 VERSION_NOTIFY_FILE = os.path.join(BRIDGE, "version_notify.json")
@@ -435,6 +445,27 @@ def _atomic_write(path, writer, mode=0o600):
     if mode is not None:
         os.chmod(tmp, mode)
     os.replace(tmp, path)
+
+
+def _json_file_readable(path):
+    """True when the file is missing (fresh deploy) or parses as JSON.
+    A present-but-unparseable file is corrupt: read-modify-write
+    callers must NOT save over it, or the merge would silently
+    destroy the original contents. Same principle as upstream
+    2.4.10's pairing fix (never write back on a corrupt read) and
+    the send ledger's LedgerCorrupt fail-closed rule — applied here
+    to the state files whose loaders degrade to empty instead of
+    raising (session, contacts, seen ids, unknown senders). Callers
+    skip the save and leave the file in place for operator
+    inspection; the load already warned on stderr."""
+    if not os.path.exists(path):
+        return True
+    try:
+        with open(path) as f:
+            json.load(f)
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _save_version_notify(state):
@@ -1166,7 +1197,10 @@ def mark_seen(ids):
     seen = load_seen()
     have = set(seen)
     merged = seen + [i for i in (str(x) for x in ids) if i not in have]
-    if len(merged) != len(seen):
+    if len(merged) != len(seen) and _json_file_readable(SEEN_FILE):
+        # A corrupt seen file is left in place instead of being
+        # overwritten with just this batch: wiping the dedupe history
+        # could double-reply a redelivery.
         save_seen(merged, keep=max(SEEN_CAP, len(ids)))
 
 
@@ -1201,6 +1235,10 @@ def note_unknown_sender(from_id):
             book = json.load(f)
     except Exception:
         book = {}
+    if not _json_file_readable(path):
+        # Corrupt approval queue: leave it in place for inspection
+        # instead of overwriting it with just this sender.
+        return
     now = int(time.time())
     ent = book.get(from_id) or {"first_seen": now, "count": 0}
     ent["last_seen"] = now
@@ -1354,10 +1392,12 @@ def _send_welcome_segment(to_user_id, context_token, text, token, client_id):
                 continue
             print(f"BIND_SEND_ERROR:{e}", file=sys.stderr, flush=True)
             return False, None
-        code = data.get("code", 0)
-        if code == 0:
-            return True, code
-        return False, code
+        outcome = _classify_send_response(data, require_message_id=True)
+        if outcome == "ok":
+            return True, 0
+        if outcome == "token_expired":
+            return False, -14
+        return False, data.get("code", 0)
     return False, None
 
 
@@ -1392,7 +1432,7 @@ def _deliver_pending_welcome(token):
         state["welcome_sent"] = sent
         save_bind_state(state)
     commit = state.get("commit") or {}
-    if commit.get("cursor"):
+    if commit.get("cursor") and _json_file_readable(SESSION_FILE):
         s = load_session()
         s["cursor"] = commit["cursor"]
         save_session(s)
@@ -1449,7 +1489,7 @@ def cmd_bind(wait_secs=BIND_DEFAULT_SECONDS):
             try:
                 data = api("POST", "ilink/bot/getupdates",
                            {"get_updates_buf": buf,
-                            "base_info": {"channel_version": "1.0.2"}},
+                            "base_info": {"channel_version": CHANNEL_VERSION}},
                            token=token, timeout=40)
             except Exception as e:
                 print(f"BIND_ERROR:{e}", file=sys.stderr, flush=True)
@@ -1481,7 +1521,7 @@ def cmd_bind(wait_secs=BIND_DEFAULT_SECONDS):
                 # Nothing claimable in this batch: commit it and keep
                 # waiting, so the normal driver never replays it later.
                 if new_buf != buf or new_ids:
-                    if new_buf:
+                    if new_buf and _json_file_readable(SESSION_FILE):
                         s["cursor"] = new_buf
                         save_session(s)
                     mark_seen(new_ids)
@@ -1490,7 +1530,10 @@ def cmd_bind(wait_secs=BIND_DEFAULT_SECONDS):
             # Claim first, welcome second: once owner.json exists the
             # window is closed to everyone else, whatever happens next.
             save_owner(winner)
-            if winner_ctx:
+            if winner_ctx and _json_file_readable(CONTACTS_FILE):
+                # A corrupt contacts file is left alone (the winner's
+                # token refreshes on their next inbound message);
+                # overwriting it would wipe every cached token.
                 contacts = load_contacts()
                 contacts[winner] = {"context_token": winner_ctx,
                                     "updated_at": int(time.time())}
@@ -1760,7 +1803,7 @@ def cmd_poll():
     buf = s.get("cursor", "")
     try:
         data = api("POST", "ilink/bot/getupdates",
-                   {"get_updates_buf": buf, "base_info": {"channel_version": "1.0.2"}},
+                   {"get_updates_buf": buf, "base_info": {"channel_version": CHANNEL_VERSION}},
                    token=token, timeout=40)
     except Exception as e:
         print(f"POLL_ERROR:{e}")
@@ -1779,6 +1822,7 @@ def cmd_poll():
     quote_cache = None  # L2: lazy — loaded on the first ref_msg, not every round
     pending_entries = {}
     pending_svr = {}
+    echo_ids = set()  # bot message_ids echoed back this round (delivery confirmations)
     for m in fresh:
         if m.get("message_type") == 2:
             # The bot's own words echoed back: cache only, never queue.
@@ -1801,6 +1845,11 @@ def cmd_poll():
                 pending_entries[str(m["message_id"])] = {
                     "text": "\n".join(parts), "kind": kinds[0],
                     "from": "bot", "at": int(time.time())}
+            if m.get("message_id"):
+                # Echo of a message this bot sent: the delivery
+                # confirmation signal (issue #8, item 3). The id alone
+                # confirms it, even when the item list is empty.
+                echo_ids.add(str(m["message_id"]))
             continue
         if m.get("message_type") != 1:  # 只要用户发来的消息
             continue
@@ -1909,8 +1958,15 @@ def cmd_poll():
             pending_entries[str(m["message_id"])] = cache_entry
     if pending_entries or pending_svr:
         _quote_cache_upsert(pending_entries, pending_svr)
-    if contacts_dirty:
+    if contacts_dirty and _json_file_readable(CONTACTS_FILE):
+        # Skip the save when the file on disk is corrupt: the merged
+        # dict would otherwise overwrite every cached context token
+        # with just this round's sender. The tokens refresh on the
+        # next inbound message; the corrupt file stays for inspection.
         save_contacts(contacts)
+    # Async echo check (issue #8, item 3): confirm sent messages
+    # against this round's echoes; never raises, never resends.
+    _check_delivery_pending(echo_ids)
     # Two-phase commit: do NOT advance the cursor or record seen ids
     # here. The caller (hook script / daemon) queues the batch durably,
     # then submits the commit block below via `ilink.py commit`. A crash
@@ -1954,7 +2010,11 @@ def cmd_commit():
         print("COMMIT_ERROR:cursor must be a string")
         return 1
     mark_seen(ids)
-    if cursor:
+    if cursor and _json_file_readable(SESSION_FILE):
+        # A corrupt session file must never be overwritten with a
+        # cursor-only dict (that would wipe bot_token): skip the
+        # cursor save, the next poll re-fetches the batch and the
+        # seen ids filter it.
         s = load_session()
         s["cursor"] = cursor
         save_session(s)
@@ -1974,7 +2034,7 @@ def _send_raw(to_user_id, context_token, text, token, client_id=None):
             "message_state": 2,
             "item_list": [{"type": 1, "text_item": {"text": text}}],
         },
-        "base_info": {"channel_version": "1.0.2"},
+        "base_info": {"channel_version": CHANNEL_VERSION},
     }
     if context_token:
         body["msg"]["context_token"] = context_token
@@ -2026,6 +2086,74 @@ class LedgerCorrupt(Exception):
     back to an empty ledger, because an empty ledger forgets every
     recorded success and the next retry of an old key would send with
     a fresh client_id the server cannot dedupe against."""
+
+
+def _load_delivery_pending():
+    """Pending echo confirmations: {message_id: {to, client_id, at, kind}}.
+    Fail-open on purpose: a damaged file reads as empty instead of
+    aborting the poll round — a missed confirmation is a lost signal,
+    never a lost message."""
+    try:
+        with open(DELIVERY_PENDING_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def _record_delivery_pending(message_id, to_user_id, client_id, kind):
+    """Note a successfully sent message for echo confirmation.
+    Never raises and never changes the send outcome: a failure to
+    record only loses the confirmation signal."""
+    try:
+        pending = _load_delivery_pending()
+        pending[str(message_id)] = {
+            "to": to_user_id, "client_id": client_id,
+            "at": int(time.time()), "kind": kind}
+        if len(pending) > DELIVERY_PENDING_CAP:
+            for mid in sorted(pending,
+                              key=lambda m: pending[m].get("at", 0)
+                              )[:len(pending) - DELIVERY_PENDING_CAP]:
+                del pending[mid]
+        _atomic_write(DELIVERY_PENDING_FILE,
+                      lambda f: json.dump(pending, f))
+    except Exception:
+        pass
+
+
+def _check_delivery_pending(echo_ids, now=None):
+    """Match this poll round's bot echoes against pending sends.
+    Returns (confirmed, unconfirmed) message_id lists. An echo within
+    the timeout confirms the send; an entry older than
+    DELIVERY_ECHO_TIMEOUT with no echo is reported no_echo in the
+    audit log and dropped. Never raises: a failure here must not
+    break the poll round. Never resends: an unconfirmed message may
+    still have been delivered, so the only action is the audit line."""
+    now = int(now if now is not None else time.time())
+    try:
+        pending = _load_delivery_pending()
+    except Exception:
+        return [], []
+    if not pending:
+        return [], []
+    confirmed = [mid for mid in pending if mid in echo_ids]
+    unconfirmed = [mid for mid, ent in pending.items()
+                   if mid not in echo_ids
+                   and now - int(ent.get("at", 0)) > DELIVERY_ECHO_TIMEOUT]
+    if not confirmed and not unconfirmed:
+        return [], []
+    try:
+        for mid in unconfirmed:
+            ent = pending.get(mid) or {}
+            _audit_send("delivery", ent.get("to") or "",
+                        ent.get("client_id") or "", "no_echo")
+        for mid in confirmed + unconfirmed:
+            pending.pop(mid, None)
+        _atomic_write(DELIVERY_PENDING_FILE,
+                      lambda f: json.dump(pending, f))
+    except Exception:
+        pass
+    return confirmed, unconfirmed
 
 
 def _load_send_ledger():
@@ -2255,13 +2383,12 @@ def _classify_send_response(data, require_message_id=False):
     code -14 is always token expiry; code != 0 is an application failure.
     When require_message_id is set (media sends), a code-0 response with
     no message_id is also an application failure, not a success.
-    Contract note (S5, deliberately NOT enforced): text sends accept
-    code==0 without message_id, while media sends require it. The
-    standing contract is that the server always returns message_id for
-    a successful text send, so a code-0 reply without one would be a
-    server-contract surprise (currently accepted, not failed); aligning
-    text with media here would change success semantics and is left
-    for a separate decision."""
+    Contract note (S5, decided 2026-11-23, issue #8): text sends now
+    also require message_id, like media sends. A code-0 reply without
+    one is a silent drop — the server accepted nothing — and must
+    surface as an application failure instead of being recorded as
+    sent. The standing contract is that the server always returns
+    message_id for a successful send."""
     code = data.get("code", 0)
     if code == -14:
         return "token_expired"
@@ -2349,11 +2476,11 @@ def cmd_proactive(to_user_id, text, key=None):
                     error=type(e).__name__, attempt=1)
         print(f"SEND_ERROR:{e}")
         return 1
-    retry = _proactive_needs_tokenless_retry(data)
+    retry = _proactive_needs_tokenless_retry(data, require_message_id=True)
     _audit_send("proactive", to_user_id, client_id,
                 "app_error" if retry else "ok",
                 elapsed_ms=int((time.time() - t0) * 1000), attempt=1)
-    if _classify_send_response(data) == "token_expired":
+    if _classify_send_response(data, require_message_id=True) == "token_expired":
         return _report_token_status()
     if retry:
         # context_token 可能过期，去掉 token 重试一次
@@ -2366,13 +2493,13 @@ def cmd_proactive(to_user_id, text, key=None):
                         error=type(e).__name__, attempt=2)
             print(f"SEND_ERROR:{e}")
             return 1
+        outcome2 = _classify_send_response(data, require_message_id=True)
         _audit_send("proactive", to_user_id, client_id,
-                    "ok" if data.get("code", 0) == 0 else "app_error",
+                    "ok" if outcome2 == "ok" else "app_error",
                     elapsed_ms=int((time.time() - t0) * 1000), attempt=2)
-        code = data.get("code", 0)
-        if code == -14:
+        if outcome2 == "token_expired":
             return _report_token_status()
-        if code != 0:
+        if outcome2 != "ok":
             print(f"PROACTIVE_FAILED:{str(data)[:200]}")
             return 1
     if key:
@@ -2393,6 +2520,8 @@ def cmd_proactive(to_user_id, text, key=None):
         _quote_cache_upsert({str(data["message_id"]): {
             "text": text, "kind": "text", "from": "bot",
             "at": int(time.time())}})
+        _record_delivery_pending(str(data["message_id"]), to_user_id,
+                                 client_id, "text")
     _clear_token_stale()
     print("PROACTIVE_OK")
     return 0
@@ -2450,7 +2579,7 @@ def cmd_send(to_user_id, context_token, text, key=None):
             "message_state": 2,
             "item_list": [{"type": 1, "text_item": {"text": text}}],
         },
-        "base_info": {"channel_version": "1.0.2"},
+        "base_info": {"channel_version": CHANNEL_VERSION},
     }
     if context_token:
         # L15: align with _send_raw, which only sends a truthy
@@ -2468,7 +2597,7 @@ def cmd_send(to_user_id, context_token, text, key=None):
                 continue
             print(f"SEND_ERROR:{e}")
             return 1
-        outcome = _classify_send_response(data)
+        outcome = _classify_send_response(data, require_message_id=True)
         _audit_send("send", to_user_id, client_id,
                     "ok" if outcome == "ok" else "app_error",
                     elapsed_ms=int((time.time() - t0) * 1000), attempt=attempt)
@@ -2495,6 +2624,8 @@ def cmd_send(to_user_id, context_token, text, key=None):
             _quote_cache_upsert({str(data["message_id"]): {
                 "text": text, "kind": "text", "from": "bot",
                 "at": int(time.time())}})
+            _record_delivery_pending(str(data["message_id"]), to_user_id,
+                                     client_id, "text")
         _clear_token_stale()
         print("SEND_OK")
         return 0
@@ -2513,7 +2644,7 @@ def _typing_ticket(to_user_id, token, force=False):
         return None
     data = api("POST", "ilink/bot/getconfig",
                {"ilink_user_id": to_user_id, "context_token": ctx,
-                "base_info": {"channel_version": "1.0.2"}},
+                "base_info": {"channel_version": CHANNEL_VERSION}},
                token=token, timeout=20)
     ticket = data.get("typing_ticket")
     if ticket:
@@ -2544,7 +2675,7 @@ def cmd_typing(to_user_id, status_word):
         data = api("POST", "ilink/bot/sendtyping",
                    {"ilink_user_id": to_user_id, "typing_ticket": ticket,
                     "status": status,
-                    "base_info": {"channel_version": "1.0.2"}},
+                    "base_info": {"channel_version": CHANNEL_VERSION}},
                    token=token, timeout=20)
         if data.get("ret", 0) != 0:
             # ticket 可能已失效，强制刷新后重试一次；刷新仍无票据时
@@ -2556,7 +2687,7 @@ def cmd_typing(to_user_id, status_word):
             data = api("POST", "ilink/bot/sendtyping",
                        {"ilink_user_id": to_user_id, "typing_ticket": ticket,
                         "status": status,
-                        "base_info": {"channel_version": "1.0.2"}},
+                        "base_info": {"channel_version": CHANNEL_VERSION}},
                        token=token, timeout=20)
             if data.get("ret", 0) != 0:
                 print(f"TYPING_FAILED:{str(data)[:200]}")
@@ -2590,7 +2721,7 @@ def _send_item_raw(to_user_id, context_token, item, token, client_id=None):
             "message_state": 2,
             "item_list": [item],
         },
-        "base_info": {"channel_version": "1.0.2"},
+        "base_info": {"channel_version": CHANNEL_VERSION},
     }
     if context_token:
         body["msg"]["context_token"] = context_token
@@ -2620,7 +2751,7 @@ def _upload_media(to_user_id, data, media_type, token):
         "filesize": len(ciphertext),
         "aeskey": aeskey_hex,
         "no_need_thumb": True,
-        "base_info": {"channel_version": "1.0.2"},
+        "base_info": {"channel_version": CHANNEL_VERSION},
     }
     r = api("POST", "ilink/bot/getuploadurl", body, token=token, timeout=20)
     upload_param = r.get("upload_param")
@@ -2757,6 +2888,8 @@ def cmd_send_media(to_user_id, context_token, path, media_type, playtime_ms=0, k
             "kind": ITEM_TYPE_NAMES.get(media_type, "file"),
             "from": "bot", "at": int(time.time()),
             "media_path": path}})
+        _record_delivery_pending(str(data_resp["message_id"]), to_user_id,
+                                 client_id, "media")
     _clear_token_stale()
     print("SEND_OK")
     return 0
@@ -2863,6 +2996,8 @@ def cmd_proactive_media(to_user_id, path, media_type, playtime_ms=0, key=None):
             "kind": ITEM_TYPE_NAMES.get(media_type, "file"),
             "from": "bot", "at": int(time.time()),
             "media_path": path}})
+        _record_delivery_pending(str(data_resp["message_id"]), to_user_id,
+                                 client_id, "media")
     _clear_token_stale()
     print("PROACTIVE_OK")
     return 0
@@ -2900,6 +3035,55 @@ def _queue_count(path):
     return len(data["msgs"]), False
 
 
+# Shared-context snapshot freshness (design C6): health reports the
+# snapshot's version and age, and warns when it has not been refreshed
+# for over 12 hours — otherwise a silently dead generator is invisible.
+# Missing is only a line, not a warning: a deploy without the snapshot
+# generator is a valid state, and the Worker silently skips a missing
+# snapshot anyway. A present-but-unreadable header is a warning: the
+# file exists, so something is wrong with it.
+SNAPSHOT_STALE_SECONDS = 12 * 3600
+
+
+def _shared_context_snapshot_status(state_dir, now):
+    """(line, warning): one health line for the shared-context snapshot
+    plus a warning string (or None). Never raises."""
+    path = os.path.join(state_dir, "shared-context.md")
+    try:
+        with open(path) as f:
+            header = f.read(4096)
+    except FileNotFoundError:
+        return ("snapshot: missing (shared-context.md not found)", None)
+    except Exception:
+        return ("snapshot: unreadable (shared-context.md could not be read)",
+                "shared-context snapshot could not be read")
+    version = None
+    updated_at = None
+    for ln in header.splitlines():
+        if ln.startswith("version:"):
+            version = ln.split(":", 1)[1].strip()
+        elif ln.startswith("updated_at:"):
+            updated_at = ln.split(":", 1)[1].strip()
+    if not updated_at:
+        return ("snapshot: unreadable (no updated_at in header)",
+                "shared-context snapshot header has no usable updated_at")
+    try:
+        ts = datetime.fromisoformat(
+            updated_at.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return ("snapshot: unreadable (updated_at is not ISO-8601)",
+                "shared-context snapshot updated_at is not parseable: "
+                f"{updated_at[:40]}")
+    age = max(0, now - int(ts))
+    ver = f"v{version}" if version else "unversioned"
+    line = f"snapshot: {ver}, {_fmt_age(age)} old"
+    if age > SNAPSHOT_STALE_SECONDS:
+        return (line,
+                "shared-context snapshot is stale: last updated "
+                f"{_fmt_age(age)} ago (> 12h) — the generator may have stopped")
+    return (line, None)
+
+
 def cmd_health(offline=False):
     """Self-check: auth, live token probe, message queue, last poll error.
     Exit code 0 = healthy, 1 = warnings, 2 = broken."""
@@ -2931,7 +3115,7 @@ def cmd_health(offline=False):
             try:
                 data = api("POST", "ilink/bot/getconfig",
                            {"ilink_user_id": owner, "context_token": ctx,
-                            "base_info": {"channel_version": "1.0.2"}},
+                            "base_info": {"channel_version": CHANNEL_VERSION}},
                            token=token, timeout=12)
                 if data.get("typing_ticket"):
                     lines.append("probe: token valid (getconfig OK)")
@@ -2971,6 +3155,14 @@ def cmd_health(offline=False):
             lines.append(f"queue: processing in flight ({_fmt_age(claimed_age)})")
     else:
         lines.append("queue: nothing processing")
+
+    # Shared-context snapshot freshness (design C6): same state dir as
+    # the queue above. A stale snapshot means the hourly generator has
+    # stopped refreshing it, which the Worker would silently tolerate.
+    snap_line, snap_warn = _shared_context_snapshot_status(state_dir, now)
+    lines.append(snap_line)
+    if snap_warn:
+        warnings.append(snap_warn)
 
     try:
         lines.append(f"dedupe: {len(load_seen())} message ids recorded")
@@ -3093,7 +3285,7 @@ def cmd_smoke_test(no_send=False, to_user_id=None):
             try:
                 data = api("POST", "ilink/bot/getconfig",
                            {"ilink_user_id": target, "context_token": ctx,
-                            "base_info": {"channel_version": "1.0.2"}},
+                            "base_info": {"channel_version": CHANNEL_VERSION}},
                            token=token, timeout=12)
             except Exception as e:
                 _check("login", "FAIL", f"probe failed: {type(e).__name__}")
