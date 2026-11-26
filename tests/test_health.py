@@ -11,6 +11,7 @@ no session -> exit 2, fresh session -> exit 0, stale processing claim
 (simulated by jumping the clock forward) -> exit 1.
 """
 import contextlib
+from datetime import datetime, timezone
 import io
 import json
 import os
@@ -45,6 +46,22 @@ def run_health():
 def write_session(**kw):
     with open(os.path.join(DATA_DIR, "session.json"), "w") as f:
         json.dump(kw, f)
+
+
+def write_snapshot(version="33", age_seconds=1800, updated_at=None):
+    # updated_at=None means "age_seconds ago"; pass updated_at="" to
+    # omit the line, or a literal string for a malformed timestamp.
+    if updated_at is None:
+        updated_at = datetime.fromtimestamp(
+            time.time() - age_seconds, tz=timezone.utc).isoformat()
+    lines = []
+    if version is not None:
+        lines.append(f"version: {version}")
+    if updated_at:
+        lines.append(f"updated_at: {updated_at}")
+    lines.append("ttl_hours: 6")
+    with open(os.path.join(STATE_DIR, "shared-context.md"), "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 class HealthTest(unittest.TestCase):
@@ -169,6 +186,49 @@ class HealthTest(unittest.TestCase):
         code, out = run_health()
         self.assertEqual(code, 0)
         self.assertIn("processing in flight", out)
+
+    def test_missing_snapshot_is_reported_not_fatal(self):
+        # A deploy without the snapshot generator is a valid state:
+        # health reports the line but does not warn.
+        write_session(bot_token="tok", login_at=int(time.time()) - 3600)
+        code, out = run_health()
+        self.assertEqual(code, 0)
+        self.assertIn("snapshot: missing", out)
+        self.assertNotIn("snapshot is stale", out)
+
+    def test_fresh_snapshot_reports_version_and_age(self):
+        write_session(bot_token="tok", login_at=int(time.time()) - 3600)
+        write_snapshot(version="33", age_seconds=1800)
+        code, out = run_health()
+        self.assertEqual(code, 0)
+        self.assertIn("snapshot: v33, 30m old", out)
+
+    def test_stale_snapshot_warns(self):
+        # Design C6: over 12h without a refresh means the hourly
+        # generator may have stopped — health must say so.
+        write_session(bot_token="tok", login_at=int(time.time()) - 3600)
+        write_snapshot(version="33", age_seconds=13 * 3600)
+        code, out = run_health()
+        self.assertEqual(code, 1)
+        self.assertIn("snapshot: v33, 13h old", out)
+        self.assertIn("snapshot is stale", out)
+        self.assertIn("verdict: WARNINGS", out)
+
+    def test_snapshot_without_updated_at_warns(self):
+        write_session(bot_token="tok", login_at=int(time.time()) - 3600)
+        write_snapshot(version="33", updated_at="")
+        code, out = run_health()
+        self.assertEqual(code, 1)
+        self.assertIn("snapshot: unreadable", out)
+        self.assertIn("no usable updated_at", out)
+
+    def test_snapshot_with_bad_timestamp_warns(self):
+        write_session(bot_token="tok", login_at=int(time.time()) - 3600)
+        write_snapshot(version="33", updated_at="not-a-date")
+        code, out = run_health()
+        self.assertEqual(code, 1)
+        self.assertIn("snapshot: unreadable", out)
+        self.assertIn("not parseable", out)
 
 
 if __name__ == "__main__":

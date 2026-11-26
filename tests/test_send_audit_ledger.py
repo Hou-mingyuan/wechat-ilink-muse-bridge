@@ -68,7 +68,7 @@ class AuditTest(unittest.TestCase):
         _pin_paths(self)
 
     def test_send_success_audited(self):
-        with mock.patch.object(ilink, "api", return_value={"code": 0}):
+        with mock.patch.object(ilink, "api", return_value={"code": 0, "message_id": "mid-1"}):
             code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi")
         self.assertEqual(code, 0)
         self.assertIn("SEND_OK", out)
@@ -111,8 +111,9 @@ class AuditTest(unittest.TestCase):
         def fake_api(*args, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
-                return {"code": 0, "ret": -2, "errmsg": ""}
-            return {"code": 0}
+                return {"code": 0, "ret": -2, "errmsg": "",
+                    "message_id": "mid-0"}
+            return {"code": 0, "message_id": "mid-1"}
 
         with mock.patch.object(ilink, "api", side_effect=fake_api):
             code, out = _run(ilink.cmd_proactive, "u1", "hello")
@@ -128,7 +129,7 @@ class AuditTest(unittest.TestCase):
     def test_audit_write_failure_does_not_change_result(self):
         ilink.SEND_AUDIT_FILE = os.path.join(DATA_DIR, "no-such-dir",
                                              "audit.jsonl")
-        with mock.patch.object(ilink, "api", return_value={"code": 0}):
+        with mock.patch.object(ilink, "api", return_value={"code": 0, "message_id": "mid-1"}):
             code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi")
         self.assertEqual(code, 0)
         self.assertIn("SEND_OK", out)
@@ -137,7 +138,7 @@ class AuditTest(unittest.TestCase):
         with open(ilink.SEND_AUDIT_FILE, "w") as f:
             for i in range(1005):
                 f.write(json.dumps({"ts": i, "direction": "old"}) + "\n")
-        with mock.patch.object(ilink, "api", return_value={"code": 0}):
+        with mock.patch.object(ilink, "api", return_value={"code": 0, "message_id": "mid-1"}):
             code, _ = _run(ilink.cmd_send, "u1", "ctx-1", "hi")
         self.assertEqual(code, 0)
         lines = _audit_lines()
@@ -150,7 +151,7 @@ class LedgerTest(unittest.TestCase):
         _pin_paths(self)
 
     def test_same_key_second_call_suppressed(self):
-        api = mock.Mock(return_value={"code": 0})
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
         with mock.patch.object(ilink, "api", api):
             code1, out1 = _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="m-1")
             code2, out2 = _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="m-1")
@@ -174,7 +175,7 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(ent["status"], "intent")
         failed_cid = api.call_args[0][2]["msg"]["client_id"]
         with mock.patch.object(ilink, "api",
-                               return_value={"code": 0}) as api2:
+                               return_value={"code": 0, "message_id": "mid-1"}) as api2:
             code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="m-2")
             code2, out2 = _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="m-2")
         self.assertIn("SEND_OK", out)
@@ -183,7 +184,7 @@ class LedgerTest(unittest.TestCase):
                          failed_cid)
 
     def test_different_keys_independent(self):
-        api = mock.Mock(return_value={"code": 0})
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
         with mock.patch.object(ilink, "api", api):
             _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="m-1")
             _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="m-2")
@@ -196,7 +197,7 @@ class LedgerTest(unittest.TestCase):
         # retry resend under a fresh client_id.
         with open(ilink.SEND_LEDGER_FILE, "w") as f:
             f.write("garbage{")
-        api = mock.Mock(return_value={"code": 0})
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
         with mock.patch.object(ilink, "api", api):
             code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="m-3")
         self.assertEqual(code, 1)
@@ -208,7 +209,7 @@ class LedgerTest(unittest.TestCase):
         with open(ilink.SEND_LEDGER_FILE, "w") as f:
             json.dump({"m-old": {"client_id": "c", "at": int(time.time()) - 90000,
                                   "result": "ok"}}, f)
-        api = mock.Mock(return_value={"code": 0})
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
         with mock.patch.object(ilink, "api", api):
             code, out = _run(ilink.cmd_send, "u1", "ctx-1", "hi", key="m-old")
         self.assertIn("SEND_OK", out)
@@ -239,7 +240,7 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(api.call_count, 1)
 
     def test_proactive_key_suppressed(self):
-        api = mock.Mock(return_value={"code": 0})
+        api = mock.Mock(return_value={"code": 0, "message_id": "mid-1"})
         with mock.patch.object(ilink, "api", api):
             code1, out1 = _run(ilink.cmd_proactive, "u1", "hello", key="p-1")
             code2, out2 = _run(ilink.cmd_proactive, "u1", "hello", key="p-1")
